@@ -178,7 +178,8 @@ TEST(CodeEvents) {
       v8::base::TimeDelta::FromMicroseconds(100), true);
   CHECK(processor->Start());
   ProfilerListener profiler_listener(isolate, processor,
-                                     *code_observer.strings());
+                                     *code_observer.strings(),
+                                     *code_observer.weak_code_registry());
   isolate->logger()->AddCodeEventListener(&profiler_listener);
 
   // Enqueue code creation events.
@@ -243,7 +244,8 @@ TEST(TickEvents) {
   profiles->StartProfiling("");
   CHECK(processor->Start());
   ProfilerListener profiler_listener(isolate, processor,
-                                     *code_observer->strings());
+                                     *code_observer->strings(),
+                                     *code_observer->weak_code_registry());
   isolate->logger()->AddCodeEventListener(&profiler_listener);
 
   profiler_listener.CodeCreateEvent(i::Logger::BUILTIN_TAG, frame1_code, "bbb");
@@ -404,7 +406,8 @@ TEST(Issue1398) {
   profiles->StartProfiling("");
   CHECK(processor->Start());
   ProfilerListener profiler_listener(isolate, processor,
-                                     *code_observer->strings());
+                                     *code_observer->strings(),
+                                     *code_observer->weak_code_registry());
 
   profiler_listener.CodeCreateEvent(i::Logger::BUILTIN_TAG, code, "bbb");
 
@@ -558,7 +561,7 @@ v8::CpuProfile* ProfilerHelper::Run(v8::Local<v8::Function> function,
                                     ProfilingMode mode, unsigned max_samples) {
   v8::Local<v8::String> profile_name = v8_str("my_profile");
 
-  profiler_->SetSamplingInterval(100);
+  profiler_->SetSamplingInterval(50);
   profiler_->StartProfiling(profile_name, {mode, max_samples, 0});
 
   v8::internal::CpuProfiler* iprofiler =
@@ -1272,7 +1275,8 @@ static void TickLines(bool optimize) {
   isolate->logger()->LogCompiledFunctions();
   CHECK(processor->Start());
   ProfilerListener profiler_listener(isolate, processor,
-                                     *code_observer->strings());
+                                     *code_observer->strings(),
+                                     *code_observer->weak_code_registry());
 
   // Enqueue code creation events.
   i::Handle<i::String> str = factory->NewStringFromAsciiChecked(func_name);
@@ -2212,16 +2216,22 @@ TEST(FunctionDetails) {
   const v8::CpuProfile* profile = i::ProfilerExtension::last_profile;
   reinterpret_cast<const i::CpuProfile*>(profile)->Print();
   // The tree should look like this:
-  //  0   (root) 0 #1
-  //  0    "" 19 #2 no reason script_b:1
-  //  0      baz 19 #3 TryCatchStatement script_b:3
-  //  0        foo 18 #4 TryCatchStatement script_a:2
-  //  1          bar 18 #5 no reason script_a:3
+  //  0  (root):0 3 0 #1
+  //  0    :0 0 5 #2 script_b:0
+  //  0      baz:3 0 5 #3 script_b:3
+  //             bailed out due to 'Optimization is always disabled'
+  //  0        foo:4 0 4 #4 script_a:4
+  //               bailed out due to 'Optimization is always disabled'
+  //  0          bar:5 0 4 #5 script_a:5
+  //                 bailed out due to 'Optimization is always disabled'
+  //  0            startProfiling:0 2 0 #6
   const v8::CpuProfileNode* root = profile->GetTopDownRoot();
   CHECK_EQ(root->GetParent(), nullptr);
   const v8::CpuProfileNode* script = GetChild(env, root, "");
   CheckFunctionDetails(env->GetIsolate(), script, "", "script_b", true,
-                       script_b->GetUnboundScript()->GetId(), 1, 1, root);
+                       script_b->GetUnboundScript()->GetId(),
+                       v8::CpuProfileNode::kNoLineNumberInfo,
+                       CpuProfileNode::kNoColumnNumberInfo, root);
   const v8::CpuProfileNode* baz = GetChild(env, script, "baz");
   CheckFunctionDetails(env->GetIsolate(), baz, "baz", "script_b", true,
                        script_b->GetUnboundScript()->GetId(), 3, 16, script);
@@ -2290,7 +2300,7 @@ TEST(FunctionDetailsInlining) {
   //   The tree should look like this:
   //  0  (root) 0 #1
   //  5    (program) 0 #6
-  //  2     14 #2 script_a:1
+  //  2     14 #2 script_a:0
   //    ;;; deopted at script_id: 14 position: 299 with reason 'Insufficient
   //    type feedback for call'.
   //  1      alpha 14 #4 script_a:1
@@ -2301,7 +2311,9 @@ TEST(FunctionDetailsInlining) {
   CHECK_EQ(root->GetParent(), nullptr);
   const v8::CpuProfileNode* script = GetChild(env, root, "");
   CheckFunctionDetails(env->GetIsolate(), script, "", "script_a", false,
-                       script_a->GetUnboundScript()->GetId(), 1, 1, root);
+                       script_a->GetUnboundScript()->GetId(),
+                       v8::CpuProfileNode::kNoLineNumberInfo,
+                       v8::CpuProfileNode::kNoColumnNumberInfo, root);
   const v8::CpuProfileNode* alpha = FindChild(env, script, "alpha");
   // Return early if profiling didn't sample alpha.
   if (!alpha) return;
@@ -4145,6 +4157,38 @@ TEST(BytecodeFlushEventsEagerLogging) {
 
     CHECK(!code_map->FindEntry(bytecode_start));
   }
+}
+
+// Ensure that unused code entries are removed after GC with eager logging.
+TEST(ClearUnusedWithEagerLogging) {
+  ManualGCScope manual_gc;
+  TestSetup test_setup;
+  LocalContext env;
+  i::Isolate* isolate = CcTest::i_isolate();
+  i::HandleScope scope(isolate);
+
+  CpuProfiler profiler(isolate, kDebugNaming, kEagerLogging);
+
+  CodeMap* code_map = profiler.code_map_for_test();
+  size_t initial_size = code_map->size();
+
+  {
+    // Create and run a new script and function, generating 2 code objects.
+    i::HandleScope inner_scope(isolate);
+    CompileRun(
+        "function some_func() {}"
+        "some_func();");
+    CHECK_GT(code_map->size(), initial_size);
+  }
+
+  // Perform a few GCs, ensuring that the executed code's bytecode is flushed.
+  const int kAgingThreshold = 8;
+  for (int i = 0; i < kAgingThreshold; i++) {
+    CcTest::CollectAllGarbage();
+  }
+
+  // Verify that the CodeMap's size is unchanged post-GC.
+  CHECK_EQ(code_map->size(), initial_size);
 }
 
 }  // namespace test_cpu_profiler

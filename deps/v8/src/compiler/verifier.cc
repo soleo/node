@@ -1617,15 +1617,18 @@ void Verifier::Visitor::Check(Node* node, const AllNodes& all) {
       CheckValueInputIs(node, 0, Type::ExternalPointer());  // callee
       CheckValueInputIs(node, 1, Type::Any());              // receiver
       break;
+#if V8_ENABLE_WEBASSEMBLY
     case IrOpcode::kJSWasmCall:
       CHECK_GE(value_count, 3);
       CheckTypeIs(node, Type::Any());
       CheckValueInputIs(node, 0, Type::Any());  // callee
       break;
+#endif  // V8_ENABLE_WEBASSEMBLY
 
     // Machine operators
     // -----------------------
     case IrOpcode::kLoad:
+    case IrOpcode::kLoadImmutable:
     case IrOpcode::kPoisonedLoad:
     case IrOpcode::kProtectedLoad:
     case IrOpcode::kProtectedStore:
